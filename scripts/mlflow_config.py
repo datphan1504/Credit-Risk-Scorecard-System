@@ -1,0 +1,8 @@
+# scripts/mlflow_config.py
+from dotenv import load_dotenv
+
+load_dotenv()
+MLFLOW_MODEL_NAME='CreditRisk-LogisticRegression'
+MLFLOW_MODEL_ALIAS = 'production'
+DAGSHUB_REPO_OWNER = 'datphan1504'
+DAGSHUB_REPO_NAME = 'Credit-Risk-Scorecard-System'
