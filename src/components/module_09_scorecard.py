@@ -1,0 +1,653 @@
+from src.entity.artifact_entity import FeatureBinMergingArtifact,ModelTrainigArtifact,FeatureEngArtifact,ScorecardArtifact
+import numpy as np
+import joblib
+import pickle
+from scipy.stats import ks_2samp
+import pandas as pd
+import json
+from src.exception import MyException
+from src.logger import config_logger
+import sys
+
+import matplotlib.pyplot as plt
+
+logger = config_logger('module_09_scorecard')
+
+
+class Scorecard:
+    '''
+    Builds a PDO-scaled credit scorecard from trained logistic regression model
+    and WoE-based bins
+    Convert the model log odds output to scores
+    output:
+    - final_scorecard_rules:
+    - final_deciles_scorecard:
+    - scorecard_scaling_params:
+    
+    '''
+    def __init__(self):
+        self.merge_artifact   = FeatureBinMergingArtifact()
+        self.model_artifact   = ModelTrainigArtifact()
+        self.fe_artifact    = FeatureEngArtifact()
+        self.scorecard_artifact =ScorecardArtifact()
+
+        # scorecard scaling constants 
+        self.BASE_SCORE = 600
+        self.BASE_ODDS  = 50
+        self.PDO        = 20
+        
+        self.model = None
+        self.final_features = None
+        self.intercept_points = None
+        self.scorecard_df = None
+        self.feature_type_col = 'feature_type' 
+
+        self.numerical_lookup = {}
+        self.categorical_lookup = {}
+        
+    def _compute_scaling_params(self):
+        '''
+        Compute scorecard scaling constants using PDO method.
+        Converts logistic regression intercept into scorecard
+        intercept points using PDO scaling logic..
+        
+        return:
+        - FACTOR
+        - INTERCEPT_POINTS  
+        
+        '''
+        self.model_intercept  = float(self.model.intercept_[0])
+
+        FACTOR = self.PDO / np.log(2)
+        OFFSET = self.BASE_SCORE + FACTOR * np.log(self.BASE_ODDS)
+        INTERCEPT_POINTS = OFFSET - FACTOR * self.model_intercept
+        self.intercept_points = INTERCEPT_POINTS
+
+        return FACTOR, INTERCEPT_POINTS
+    
+
+    def numerical_score_rules(self,num_bins, iv_df, feature_importance, FACTOR):
+        '''
+        Build scorecard rules for numerical features.
+        For each selected numerical feature:
+        - Attaches IV from iv_df (feature iv)
+        - Computes per-bin score points:  score_points = -(WoE * coefficient) * FACTOR
+        - Drops the 'Totals' summary row added by the binning module
+        
+        Returns:
+        num_score_rules: Scorecard rules for all numerical features.
+            [feature, Bin, WoE, Event rate, Count (%), Feature IV,
+            feature_coeff_model, score_points]'''
+
+        final_summary = {}
+
+        for feature, summary_data in num_bins.items():
+            if feature not in self.final_features:
+                continue
+
+            feature_iv   = iv_df[iv_df['feature'] == feature]['IV'].values[0]
+            feature_coef = feature_importance[feature_importance['feature'] == feature]['coeff'].values[0]
+
+            summary_data['Feature IV'] = feature_iv
+
+            df = summary_data[['feature', 'Bin', 'WoE', 'Event rate', 'Count (%)', 'Feature IV']].copy()
+
+            df['feature_coeff_model'] = feature_coef
+            df['score_points']        = 0.0
+
+            n_bin = df['Bin'].iloc[:-1].shape[0]
+
+            for bin_no in range(n_bin):
+                idx       = df.index[bin_no]
+                bin_score = (df.loc[idx, 'WoE'] * feature_coef) * (-FACTOR) 
+                df.loc[idx, 'score_points'] = bin_score
+
+            final_summary[feature] = df
+
+        num_score_rules = pd.concat(final_summary.values(), ignore_index=True)
+
+        return num_score_rules 
+        
+        
+    def categorical_score_rules(self,cat_bin_df, iv_df, feature_importance, FACTOR):
+
+        ''' 
+        Build scorecard rules for categorical features.
+
+        For each selected categorical feature:
+        - Filters bins to only final selected features
+        - Add IV and model coefficient
+        - Computes per-bin score points: -(WoE * coeff) * FACTOR
+            
+        return:
+        - Cat_scorecard: Scorecard rules for categorical features.
+            [feature, Bin, WoE, Event rate, Count (%),
+            rare_categories, Feature IV, feature_coeff_model, score_points]
+        '''
+    
+        cat_bin_df   = cat_bin_df.rename(columns={'Count(%)': 'Count (%)'})
+        cat_features = cat_bin_df['feature'].unique().tolist()
+        results      = []
+
+        for feature in self.final_features:
+            if feature not in cat_features:
+                continue
+
+            feature_coef = feature_importance[feature_importance['feature'] == feature]['coeff'].values[0]
+            feature_iv   = iv_df[iv_df['feature'] == feature]['IV'].values[0]
+
+            temp = cat_bin_df[cat_bin_df['feature'] == feature][['feature', 'Bin', 'WoE', 'Event rate', 'Count (%)', 'rare_categories']].copy()
+
+            temp['Feature IV']          = feature_iv
+            temp['feature_coeff_model'] = feature_coef
+            temp['score_points']        = (temp['WoE'] * feature_coef) * (-FACTOR)
+
+            results.append(temp)
+
+        return pd.concat(results, ignore_index=True) 
+
+
+
+    def build_scorecard_rules(self,cat_bin_df,num_bins,iv_df, feature_importance):
+        '''
+        Combine numerical and categorical scorecard rules.
+        build numerica_rules,categorical_rules
+        add fetaure_types for numerical,categorical rules df
+        then combine and create one final scorecard rules df
+        
+        returns:
+        - final_scorecard_rules: scores assigend for each feature and its bins df
+        - FACTOR
+        - INTERCEPT_POINTS
+        '''
+
+        FACTOR,  INTERCEPT_POINTS = self._compute_scaling_params()
+
+        self.num_scorecard_rules = self.numerical_score_rules(num_bins,iv_df, feature_importance, FACTOR)
+        self.num_scorecard_rules = self.num_scorecard_rules[self.num_scorecard_rules['Bin'] != 'None']
+        self.cat_scorecard_rules = self.categorical_score_rules(cat_bin_df,iv_df, feature_importance, FACTOR)
+        self.cat_scorecard_rules = self.cat_scorecard_rules[self.cat_scorecard_rules['Bin'] != 'None']
+
+        
+        #   since this column in cat scorecard therefore create here to avoid merging error        
+        self.num_scorecard_rules['rare_categories'] = None
+
+        self.num_scorecard_rules['feature_type'] = 'numerical'
+        self.cat_scorecard_rules['feature_type'] = 'categorical'
+
+        # one scorecard to rule them all
+        final_scorecard_rules = pd.concat(
+            [self.num_scorecard_rules, self.cat_scorecard_rules], axis=0
+        ).reset_index(drop=True)
+        
+
+        return final_scorecard_rules, FACTOR, INTERCEPT_POINTS
+    
+
+    def build_numerical_lookup(self, value_col='score_points'):
+        num_lookup = {}
+        for feature, grp in self.num_scorecard_rules.groupby('feature'):
+            temp = grp.copy()
+            
+            interval_mask = temp['Bin'].str.startswith('(') | temp['Bin'].str.startswith('[')
+            special_mask  = temp['Bin'].str.startswith('SPECIAL_')
+            discrete_mask = ~interval_mask & ~special_mask
+
+            interval_df = temp[interval_mask].copy()
+            special_df  = temp[special_mask].copy()
+            discrete_df = temp[discrete_mask].copy()
+
+            interval_series = pd.Series(dtype=float)
+            if not interval_df.empty:
+                interval_df['interval_bin'] = (interval_df['Bin']
+                                                .str[1:-1]
+                                                .str.split(',')
+                                                .apply(lambda x: tuple(map(float, x))))
+                interval_index  = pd.IntervalIndex.from_tuples(interval_df['interval_bin'], closed='right')
+                interval_series = pd.Series(interval_df[value_col].values, index=interval_index)
+
+            discrete_series = pd.Series(dtype=float)
+            if not discrete_df.empty:
+                numeric_mask    = pd.to_numeric(discrete_df['Bin'], errors='coerce').notna()
+                discrete_df     = discrete_df[numeric_mask]
+                discrete_series = pd.Series(discrete_df[value_col].values,
+                                            index=pd.to_numeric(discrete_df['Bin']))
+
+            special_dict = {}
+            if not special_df.empty:
+                for _, row in special_df.iterrows():
+                    key = float(row['Bin'].replace('SPECIAL_', ''))
+                    special_dict[key] = row[value_col]
+
+            num_lookup[feature] = {
+                'interval': interval_series,
+                'discrete': discrete_series,
+                'special':  special_dict
+            }
+        return num_lookup
+
+
+    def build_categorical_lookup(self, value_col='score_points'):
+        cat_lookup = {}
+        for feature, grp in self.cat_scorecard_rules.groupby('feature'):
+            cat_lookup[feature] = dict(zip(grp['Bin'], grp[value_col]))
+        return cat_lookup
+    
+        
+    def _single_get_numerical_value(self, lookup, feature, value):
+        feature_lookup = lookup[feature]
+
+        if value in feature_lookup['special']:
+            return feature_lookup['special'][value]
+
+        if not feature_lookup['interval'].empty:
+            try:
+                feature_low  = feature_lookup['interval'].index[0].left
+                feature_high = feature_lookup['interval'].index[-1].right
+                if value < feature_low:
+                    return feature_lookup['interval'].iloc[0]
+                elif value > feature_high:
+                    return feature_lookup['interval'].iloc[-1]
+                else:
+                    return feature_lookup['interval'][value]
+            except KeyError:
+                pass
+
+        if not feature_lookup['discrete'].empty:
+            try:
+                if value < feature_lookup['discrete'].index.min():
+                    return feature_lookup['discrete'].iloc[0]
+                elif value > feature_lookup['discrete'].index.max():
+                    return feature_lookup['discrete'].iloc[-1]
+                else:
+                    return feature_lookup['discrete'][value]
+            except KeyError:
+                pass
+
+        return np.nan
+
+    def _single_get_categorical_value(self, lookup, feature, value):
+        feature_lookup = lookup[feature]
+        return feature_lookup.get(value, feature_lookup.get('RARE', np.nan))
+    
+    def _single_score_applicant(self, user_info: dict):
+        total_score = 0
+        breakdown   = {}
+
+        for feature in self.numerical_lookup.keys():
+            if feature in user_info:
+                value = user_info[feature]
+                if pd.isna(value):
+                    value = -99999.0
+                score = self._single_get_numerical_value(self.numerical_lookup, feature, value)
+                if not pd.isna(score):
+                    total_score       += score
+                    breakdown[feature] = score
+
+        for feature in self.categorical_lookup.keys():
+            if feature in user_info:
+                value = user_info[feature]
+                if pd.isna(value):
+                    value = 'MISSING'
+                score = self._single_get_categorical_value(self.categorical_lookup, feature, value)
+                if not pd.isna(score):
+                    total_score       += score
+                    breakdown[feature] = score
+
+        return {
+            'total_score': round(self.intercept_points + total_score, 4),
+            'breakdown':   breakdown
+        }
+
+
+    def get_woe_array(self, user_info: dict):
+        woe_dict = {}
+
+        for feature in self.numerical_woe_lookup.keys():
+            if feature in user_info:
+                value = user_info[feature]
+                if pd.isna(value):
+                    value = -99999.0
+                woe = self._single_get_numerical_value(self.numerical_woe_lookup, feature, value)
+                woe_dict[feature] = woe if not pd.isna(woe) else 0.0
+
+        for feature in self.categorical_woe_lookup.keys():
+            if feature in user_info:
+                value = user_info[feature]
+                if pd.isna(value):
+                    value = 'MISSING'
+                woe = self._single_get_categorical_value(self.categorical_woe_lookup, feature, value)
+                woe_dict[feature] = woe if not pd.isna(woe) else 0.0
+
+        ordered_features = [f for f in user_info.keys() if f in woe_dict]
+        return pd.DataFrame([woe_dict])[ordered_features]
+    
+    def _batch_get_num_score(self,feature, col):
+    
+        # clean the column
+        col = pd.Series(col).fillna(-99999).astype(float)
+        
+        lookup  = self.numerical_lookup[feature]
+        result  = pd.Series(np.nan, index=col.index)
+
+        # step 1 — special values (e.g. -99999 for missing)
+        for val, pts in lookup['special'].items():
+            result[col == val] = pts
+
+        # step 3 — clamp anything out of range to the nearest edge bin
+        if not lookup['interval'].empty:
+            
+            for interval, pts in lookup['interval'].items():
+                mask = result.isna() & (col > interval.left) & (col <= interval.right)
+                result[mask] = pts
+                
+            low      = lookup['interval'].index[0].left
+            high      = lookup['interval'].index[-1].right
+            low_pts  = lookup['interval'].iloc[0]
+            high_pts  = lookup['interval'].iloc[-1]
+            result[result.isna() & (col <= low)] = low_pts
+            result[result.isna() & (col >= high)] = high_pts
+        
+        if not lookup['discrete'].empty:
+            
+            discrete_map = lookup['discrete']
+
+            # direct mapping
+            mapped = col.map(discrete_map)
+
+            result[result.isna()] = mapped[result.isna()]
+
+            # clamp outside discrete range
+            low_val  = discrete_map.index.min()
+            high_val = discrete_map.index.max()
+
+            low_pts  = discrete_map.iloc[0]
+            high_pts = discrete_map.iloc[-1]
+
+            result[result.isna() & (col < low_val)] = low_pts
+            result[result.isna() & (col > high_val)] = high_pts
+
+        
+        # step 4 — anything still missing gets 0
+        return result.fillna(0.0)
+    
+    def _batch_get_cat_score(self,feature, col):
+        
+        # clean the column — convert everything to plain string
+        col = pd.Series(col).astype(str).str.strip()
+        col = col.fillna('MISSING')
+        col = col.replace({'nan': 'MISSING', '': 'MISSING', 'NaN': 'MISSING'})
+
+        lookup   = self.categorical_lookup[feature]
+        rare_pts = lookup.get('RARE', 0.0)
+
+        # if category is known return its points, otherwise return RARE points
+        return col.map(lambda x: lookup.get(x, rare_pts))
+
+    def _batch_genrate_scores(self,X):
+        
+        logger.info(f'Score Genration Started')
+        
+        score_matrix = pd.DataFrame(index=X.index)
+
+        for feature in self.numerical_lookup:
+            if feature not in X.columns:
+                print(f"[SKIP] {feature}")
+                continue
+            score_matrix[feature] = self._batch_get_num_score(feature, X[feature])
+
+        for feature in self.categorical_lookup:
+            if feature not in X.columns:
+                print(f"[SKIP] {feature}")
+                continue
+            score_matrix[feature] = self._batch_get_cat_score(feature, X[feature])
+
+        X['credit_score'] = (self.intercept_points + score_matrix.sum(axis=1)).round(2)
+
+        return X
+    
+    def build_scorecard(self, scored_df, X_woe, y_train):
+
+        good = scored_df[scored_df['TARGET'] == 0]['credit_score']
+        bad  = scored_df[scored_df['TARGET'] == 1]['credit_score']
+
+        logger.info(f"Good borrowers — mean: {good.mean()}, std: {good.std()}")
+        logger.info(f"Bad borrowers  — mean: {bad.mean()},  std: {bad.std()}")
+        logger.info(f"Separation     — diff: {good.mean() - bad.mean()} points")
+
+        model_feature_order = list(self.model.feature_names_in_)
+        X_for_pd = X_woe[model_feature_order].copy()
+
+    
+        # Calibrated PD - using pre-saved calibrated model 
+        calibrated_pd = self.calibrated_model.predict_proba(X_for_pd)[:, 1]
+        logger.info(f"Calibrated avg PD  : {calibrated_pd.mean():.4f}")
+        logger.info(f"Actual bad rate     : {y_train.mean():.4f}")
+
+        #-----------------------------------REMOVE THIS AFTER POST-----------------
+        model_pd = self.model.predict_proba(X_for_pd)[:, 1]
+        logger.info(f"None calinbration avg PD  : {calibrated_pd.mean():.4f}")
+
+       
+        #------------------------REMOVE UPPER-------------
+
+        # rest stays exactly the same
+        scored_df = scored_df.copy()
+        scored_df['pd_model'] = calibrated_pd
+
+        #-----------------------------------REMOVE THIS AFTER POST-----------------
+        
+        scored_df['non_calibration_pd'] = model_pd
+        
+        #------------------------REMOVE UPPER-------------
+        
+        #  Score decile bins 
+        scored_df['score_decile'] = pd.qcut(
+            scored_df['credit_score'], q=10, duplicates='drop'
+        )
+
+        # Aggregate per bin ─
+        decile_summary = scored_df.groupby('score_decile').agg(            
+            count            = ('TARGET',       'count'),
+            bad_count        = ('TARGET',       'sum'),
+            pd_model_avg     = ('pd_model',     'mean'),  # callibrated PD
+            #-----------------------------------REMOVE THIS AFTER POST-----------------
+            non_calibration =  ('non_calibration_pd','mean')
+        )
+        
+        #-----------------------------------REMOVE THIS AFTER POST-----------------
+
+        decile_summary['non_calibration_avg_pd_pct'] = (
+            decile_summary['non_calibration'] * 100
+        ).round(2)
+            #------------------------REMOVE UPPER-------------
+
+        
+        
+        decile_summary['good_count'] = (
+            decile_summary['count'] - decile_summary['bad_count']
+        )
+
+        # Calibrated PD %
+        decile_summary['pd_model_pct'] = (
+            decile_summary['pd_model_avg'] * 100
+        ).round(2)
+
+        decile_summary.drop(columns='pd_model_avg',inplace=True)
+        
+
+        # Observed DR
+        decile_summary['observed_dr_pct'] = (
+            (decile_summary['bad_count'] / decile_summary['count']) * 100
+        ).round(2)
+
+        #Cumulative bad capture rate 
+        decile_summary['bad_capture_rate_cumsum'] = (
+            decile_summary['bad_count'].cumsum() / decile_summary['bad_count'].sum() * 100
+        ).round(2)
+
+    
+        decile_summary = decile_summary.reset_index()
+
+        # KS 
+        ks = ks_2samp(good, bad).statistic
+        metrics = {
+            "ks"            : round(ks, 4),
+            "actual_bad_rate": round(float(y_train.mean()), 4),
+        }
+
+        logger.info(f"KS                 : {metrics['ks']}")
+        logger.info(f"Actual bad rate       : {metrics['actual_bad_rate']}")
+
+        return decile_summary, metrics
+
+        
+    def save_decile_calibration_plot(self,decile_df, save_path):
+
+        x = range(len(decile_df))
+        labels = [f'D{i}' for i in x]
+
+        plt.figure(figsize=(12, 6))
+
+        plt.plot(x, decile_df['observed_dr_pct'],            
+                marker='o', label='Actual Default Rate',  
+                color='black', linewidth=2)
+        
+        plt.plot(x, decile_df['pd_model_pct'],    
+                marker='s', label='Calibrated Model PD', 
+                color='orange', linewidth=2)
+        
+        plt.plot(x, decile_df['non_calibration_avg_pd_pct'],
+                marker='^', label='Raw Model PD',         
+                color='blue', linewidth=2)
+
+        plt.xticks(x, labels)
+        plt.xlabel("Decile (D0 = Highest Risk → D9 = Lowest Risk)")
+        plt.ylabel("Probability of Default (%)")
+        plt.title("Decile-Level Calibration: Raw vs Calibrated vs Actual Default Rate")
+        plt.legend()
+        plt.tight_layout()
+
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        
+    def orchestrate(self):
+        try:
+            logger.info("Loading trained model bundle")
+            
+            bundle              = joblib.load(self.model_artifact.model_path)
+            self.model               = bundle['model']
+            self.calibrated_model    = bundle['calibrated_model']  
+            self.final_features      = bundle['features']
+            
+            
+            logger.info(f"Model loaded successfully with {len(self.final_features)} features")
+
+            logger.info("Loading IV, feature importance, num bins, cat_bin_df files")
+            iv_df              = pd.read_csv(self.fe_artifact.iv_df_path)
+            feature_importance = pd.read_csv(self.model_artifact.feature_importance_path)
+
+            num_bins_path = self.merge_artifact.final_selected_num_bins_path
+            with open(num_bins_path, 'rb') as f:
+                num_bins = pickle.load(f)
+
+            cat_bin_df = pd.read_csv(self.fe_artifact.cat_bin_df_path)
+            logger.info("Loading IV, feature_importance, num_bins, cat_bin_df completed")
+
+            logger.info("Building scorecard rules")
+            final_scorecard_rules, FACTOR, INTERCEPT_POINTS = self.build_scorecard_rules(
+                cat_bin_df, num_bins, iv_df, feature_importance
+            )
+
+            final_scorecard_rules.to_csv(self.scorecard_artifact.final_scorecard_rules_path, index=False)
+            self.num_scorecard_rules.to_csv(self.scorecard_artifact.scorecard_numerical_rules, index=False)
+            self.cat_scorecard_rules.to_csv(self.scorecard_artifact.scorecard_categorical_rules, index=False)
+            logger.info(f'Scorecard rules saved at: {self.scorecard_artifact.scorecard_dir}')
+
+
+            # lookup
+            # score points lookups 
+            self.numerical_lookup   = self.build_numerical_lookup(value_col='score_points')
+            self.categorical_lookup = self.build_categorical_lookup(value_col='score_points')
+            joblib.dump(self.numerical_lookup, self.scorecard_artifact.scorecard_numerical_score_lookup)
+            joblib.dump(self.categorical_lookup, self.scorecard_artifact.scorecard_categorical_score_lookup)
+            
+            # WoE lookups 
+            self.numerical_woe_lookup   = self.build_numerical_lookup(value_col='WoE')
+            self.categorical_woe_lookup = self.build_categorical_lookup(value_col='WoE')
+            
+            joblib.dump(self.numerical_woe_lookup, self.scorecard_artifact.scorecard_numerical_woe_lookup)
+            joblib.dump(self.categorical_woe_lookup, self.scorecard_artifact.scorecard_categorical_woe_lookup)
+            
+            logger.info(f'Lookups saved at: {self.scorecard_artifact.scorecard_dir}')
+            
+
+            #  Load raw X_train for scoring 
+            X_train = pd.read_csv(
+                self.fe_artifact.data_splits_x_train_path,
+                usecols=self.final_features
+            )
+            y_train = pd.read_csv(
+                self.fe_artifact.data_splits_y_train_path
+            ).squeeze().reset_index(drop=True)
+            logger.info('X_train and y_train loaded')
+
+            #  Generate credit scores from raw data 
+            train_scored = self._batch_genrate_scores(X_train)
+            train_scored['TARGET'] = y_train
+            train_scored = train_scored.reset_index(drop=True)
+            logger.info('Credit scores generated for train data')
+
+            #  Load WOE data for PD calibration 
+            
+            X_woe = pd.read_csv(self.merge_artifact.X_train_final_path).reset_index(drop=True)
+            
+            if 'TARGET' in X_woe.columns:
+                X_woe = X_woe.drop(columns=['TARGET'])
+                logger.info("Dropped TARGET from X_woe")
+
+            #  Build scorecard decile table with calibrated PD 
+            final_scorecard, metrics = self.build_scorecard(train_scored, X_woe, y_train)
+            logger.info('Final ScoreCard is BUILT')
+            logger.info(final_scorecard)
+
+            #  Save train scores AFTER scorecard is built
+            
+            train_scored.to_csv(self.scorecard_artifact.train_score_df_path, index=False)
+            logger.info(f'Saved train+scores at: {self.scorecard_artifact.scorecard_dir}')
+
+            final_scorecard.to_csv(self.scorecard_artifact.final_scorecard_table_path, index=False)
+            logger.info(f'Final scorecard deciles saved to: {self.scorecard_artifact.scorecard_dir}')
+
+            with open(self.scorecard_artifact.scorecard_metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=4)
+            logger.info(f"Metrics saved at: {self.scorecard_artifact.scorecard_metrics_path}")
+
+            self.save_decile_calibration_plot(final_scorecard,self.scorecard_artifact.decile_callibration_plot_path)
+            
+            # Save scaling params 
+            params = {
+                "FACTOR"           : float(FACTOR),
+                "INTERCEPT_POINTS" : float(INTERCEPT_POINTS),
+                "BASE_SCORE"       : self.BASE_SCORE,
+                "BASE_ODDS"        : self.BASE_ODDS,
+                "PDO"              : self.PDO,
+                "intercept"        : self.intercept_points
+            }
+            with open(self.scorecard_artifact.scorecard_scaling_params_path, 'w') as f:
+                json.dump(params, f)
+            logger.info(f"Scaling parameters saved at: {self.scorecard_artifact.scorecard_scaling_params_path}")
+
+            return self.scorecard_artifact
+            logger.info("Scorecard construction completed successfully")
+
+        except Exception as e:
+            raise MyException(e, sys, logger)
+    
+if __name__ =='__main__':
+    logger.info("Starting Scorecard Orchestration Pipeline")
+    
+    scorecard = Scorecard()
+    scorecard.orchestrate()
+    logger.info("Scorecard Orchestration Completed Successfully")
